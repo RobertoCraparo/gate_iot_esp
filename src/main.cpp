@@ -22,7 +22,7 @@ SoftwareSerial mySerial(ESP_RX_PIN, ESP_TX_PIN);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
 Servo myServo;
 MFRC522 rfid(SS_PIN, RST_PIN);
-
+//ciao
 // --- PROTOTIPI ---
 void printMenu();
 uint8_t getID();
