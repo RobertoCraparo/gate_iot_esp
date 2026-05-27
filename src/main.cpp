@@ -11,7 +11,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
-#include <ArduinoJson.h> // Nuova libreria per parsing e formattazione JSON
+#include <ArduinoJson.h>
 
 // --- CONFIGURAZIONE RETE E MQTT ---
 const char* ssid = "TP-Link-Pellizzari";
@@ -24,8 +24,8 @@ const char* mqtt_user = "Utente";
 const char* mqtt_pass = "Password1";
 
 // Definizione Topic MQTT
-const char* topic_stato = "cancello/stato";             // Output: Telemetria e ID impronte
-const char* topic_comando = "cancello/comando";         // Input: Comandi di apertura remota
+const char* topic_stato = "cancello/stato";         // Output: Telemetria e ID impronte
+const char* topic_comando = "cancello/comando";     // Input: Comandi di apertura remota
 const char* topic_rfid_check = "cancello/rfid/check";   // Output: Invio UID al server
 const char* topic_rfid_response = "cancello/rfid/response"; // Input: Risposta server
 
@@ -76,6 +76,8 @@ void enrollFingerprint();
 void deleteFingerprint();
 void testFingerprint();
 void setServoDegrees();
+void openGate(String source);
+void closeGate(String source);
 void triggerServo();
 void handleFailure();
 uint8_t getID();
@@ -208,7 +210,6 @@ void reconnect_mqtt() {
 
 // Router asincrono per payload JSON in ingresso
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    // Conversione sicura in stringa null-terminated per il parsing JSON
     char jsonBuffer[length + 1];
     for (unsigned int i = 0; i < length; i++) {
         jsonBuffer[i] = (char)payload[i];
@@ -220,7 +221,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     Serial.print("] -> Payload JSON: ");
     Serial.println(jsonBuffer);
 
-    // Parsing del JSON in ingresso
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, jsonBuffer);
 
@@ -230,20 +230,33 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return;
     }
 
-    // Gestione Comando di Apertura
+    // Gestione Comando di Apertura / Chiusura (Nuovo Formato Admin)
     if (String(topic) == topic_comando) {
-        const char* cmd = doc["command"]; // Cerca la chiave "command"
-        if (cmd && String(cmd) == "APRI") {
-            Serial.println("[SISTEMA] Comando di sblocco remoto JSON autorizzato.");
-            updateDisplay("APERTURA", "DA REMOTO");
-            triggerServo();
+        const char* cmd = doc["cmd"];
+        const char* admin_nome = doc["admin_nome"];
+        String adminStr = admin_nome ? String(admin_nome) : "Remoto";
+
+        if (cmd) {
+            String commandStr = String(cmd);
+            commandStr.toLowerCase();
+
+            if (commandStr == "apri") {
+                Serial.println("[SISTEMA] Comando APRI autorizzato da admin: " + adminStr);
+                updateDisplay("APERTURA", "DA " + adminStr);
+                openGate(adminStr);
+            }
+            else if (commandStr == "chiudi") {
+                Serial.println("[SISTEMA] Comando CHIUDI autorizzato da admin: " + adminStr);
+                updateDisplay("CHIUSURA", "DA " + adminStr);
+                closeGate(adminStr);
+            }
         }
     }
 
     // Gestione Risposta Validazione RFID
     if (String(topic) == topic_rfid_response) {
         serverResponseReceived = true;
-        const char* status = doc["status"]; // Cerca la chiave "status"
+        const char* status = doc["status"];
 
         if (status && String(status) == "REGISTRATO") {
             Serial.println("[MQTT] Validazione server confermata (REGISTRATO).");
@@ -267,20 +280,23 @@ void updateDisplay(String header, String content) {
     display.display();
 }
 
-void triggerServo() {
+// Funzione atomica per l'apertura del cancello
+void openGate(String source) {
     Serial.println("\n[ATTUATORE] Apertura. PWM a 0 gradi.");
     failedAttempts = 0;
 
-    String payloadOpen = "{\"event\":\"gate\",\"status\":\"opened\"}";
+    String payloadOpen = "{\"event\":\"gate\",\"status\":\"opened\",\"by\":\"" + source + "\"}";
     mqttClient.publish(topic_stato, payloadOpen.c_str());
     Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
     Serial.println(payloadOpen);
 
     myServo.write(0);
-    delay(4000);
+}
 
+// Funzione atomica per la chiusura del cancello con ripristino hardware I2C
+void closeGate(String source) {
     Serial.println("[ATTUATORE] Chiusura. PWM a 160 gradi.");
-    String payloadClose = "{\"event\":\"gate\",\"status\":\"closed\"}";
+    String payloadClose = "{\"event\":\"gate\",\"status\":\"closed\",\"by\":\"" + source + "\"}";
     mqttClient.publish(topic_stato, payloadClose.c_str());
     Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
     Serial.println(payloadClose);
@@ -294,6 +310,13 @@ void triggerServo() {
     display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
 
     updateDisplay("STANDBY", "");
+}
+
+// Mantiene la compatibilità con il flusso 2FA temporizzato di 4 secondi
+void triggerServo() {
+    openGate("Local_Auth");
+    delay(4000);
+    closeGate("Local_Auth");
 }
 
 void handleFailure() {
@@ -382,7 +405,6 @@ void test2FA() {
                     Serial.print("[SISTEMA] Matching riuscito! ID Impronta: ");
                     Serial.println(finger.fingerID);
 
-                    // Formattazione JSON per l'impronta autorizzata
                     String bioPayload = "{\"event\":\"auth\",\"status\":\"success\",\"method\":\"fingerprint\",\"id\":" + String(finger.fingerID) + "}";
                     mqttClient.publish(topic_stato, bioPayload.c_str());
                     Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
@@ -390,7 +412,6 @@ void test2FA() {
 
                     updateDisplay("ACCESSO", "CONSENTITO");
                     triggerServo();
-
                     break;
                 } else {
                     Serial.println("[SISTEMA] Matching fallito. Impronta sconosciuta.");
@@ -418,7 +439,6 @@ void test2FA() {
                 serverResponseReceived = false;
                 serverAccessGranted = false;
 
-                // Formattazione JSON per la richiesta di check RFID
                 String rfidPayload = "{\"event\":\"rfid_check\",\"uid\":\"" + uidStr + "\"}";
                 mqttClient.publish(topic_rfid_check, rfidPayload.c_str());
                 Serial.print("[MQTT TX] Topic: cancello/rfid/check | Payload JSON: ");
