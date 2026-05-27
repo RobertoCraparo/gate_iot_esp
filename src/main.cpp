@@ -279,4 +279,364 @@ void triggerServo() {
     myServo.write(0);
     delay(4000);
 
-    Serial.println("[ATTUATORE] Chiusura. PWM a
+    Serial.println("[ATTUATORE] Chiusura. PWM a 160 gradi.");
+    String payloadClose = "{\"event\":\"gate\",\"status\":\"closed\"}";
+    mqttClient.publish(topic_stato, payloadClose.c_str());
+    Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
+    Serial.println(payloadClose);
+
+    myServo.write(160);
+
+    // FIX RECUPERO HARDWARE I2C
+    delay(500);
+    Wire.begin(SDA_PIN, SCL_PIN);
+    keyPad.begin();
+    display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+
+    updateDisplay("STANDBY", "");
+}
+
+void handleFailure() {
+    failedAttempts++;
+    Serial.print("\n[SECURITY] Tentativo di accesso negato: ");
+    Serial.print(failedAttempts);
+    Serial.println("/3");
+
+    String failPayload = "{\"event\":\"auth\",\"status\":\"failed\",\"attempts\":" + String(failedAttempts) + "}";
+    mqttClient.publish(topic_stato, failPayload.c_str());
+    Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
+    Serial.println(failPayload);
+
+    if (failedAttempts >= 3) {
+        isLocked = true;
+        Serial.println("[SECURITY] SOGLIA SUPERATA. SISTEMA BLOCCATO.");
+
+        String lockPayload = "{\"event\":\"alarm\",\"status\":\"system_locked\"}";
+        mqttClient.publish(topic_stato, lockPayload.c_str());
+        Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
+        Serial.println(lockPayload);
+
+        updateDisplay("BLOCCATO", "ACC. NEGATO");
+    }
+}
+
+void test2FA() {
+    Serial.println("\n[SISTEMA] Modalità 2FA CONTINUA attivata. Invia un carattere qualsiasi a console per uscire.");
+
+    while (true) {
+        if (isLocked) {
+            Serial.println("\n[SECURITY] Sistema attualmente inibito causa blocco.");
+            updateDisplay("BLOCCATO", "ACC. NEGATO");
+            return;
+        }
+
+        Serial.println("\n--- AVVIO FLUSSO 2FA ---");
+        updateDisplay("FASE 1: PIN", "");
+
+        String tempBuffer = "";
+        bool pinUnlocked = false;
+
+        while (!pinUnlocked) {
+            mqttClient.loop();
+            if (Serial.available()) { while(Serial.available()) Serial.read(); return; }
+
+            if (keyPad.isPressed()) {
+                char key = keyPad.getChar();
+                if (key == '#') {
+                    tempBuffer = "";
+                    updateDisplay("FASE 1: PIN", tempBuffer);
+                }
+                else if (key == '*') {
+                    if (tempBuffer == currentPassword) {
+                        Serial.println("[SISTEMA] PIN corretto. Primo fattore validato.");
+                        pinUnlocked = true;
+                    } else {
+                        Serial.println("[SISTEMA] Errore: PIN inserito non valido.");
+                        updateDisplay("ERRORE", "PIN ERRATO");
+                        handleFailure();
+                        if (isLocked) return;
+                        delay(1500);
+                        tempBuffer = "";
+                        updateDisplay("FASE 1: PIN", tempBuffer);
+                    }
+                }
+                else if (key != 'N') {
+                    tempBuffer += key;
+                    updateDisplay("FASE 1: PIN", tempBuffer);
+                }
+                delay(250);
+            }
+            delay(10);
+        }
+
+        Serial.println("[SISTEMA] In attesa di input biometrico o transponder NFC...");
+        updateDisplay("FASE 2", "NFC O DITO");
+
+        while (true) {
+            mqttClient.loop();
+            if (Serial.available()) { while(Serial.available()) Serial.read(); return; }
+
+            if (finger.getImage() == FINGERPRINT_OK && finger.image2Tz() == FINGERPRINT_OK) {
+                Serial.println("[SENS. OTTICO] Impronta rilevata. Ricerca nel database locale...");
+                if (finger.fingerSearch() == FINGERPRINT_OK) {
+                    Serial.print("[SISTEMA] Matching riuscito! ID Impronta: ");
+                    Serial.println(finger.fingerID);
+
+                    // Formattazione JSON per l'impronta autorizzata
+                    String bioPayload = "{\"event\":\"auth\",\"status\":\"success\",\"method\":\"fingerprint\",\"id\":" + String(finger.fingerID) + "}";
+                    mqttClient.publish(topic_stato, bioPayload.c_str());
+                    Serial.print("[MQTT TX] Topic: cancello/stato | Payload JSON: ");
+                    Serial.println(bioPayload);
+
+                    updateDisplay("ACCESSO", "CONSENTITO");
+                    triggerServo();
+
+                    break;
+                } else {
+                    Serial.println("[SISTEMA] Matching fallito. Impronta sconosciuta.");
+                    updateDisplay("ERRORE", "IMPRONTA NO");
+                    handleFailure();
+                    if (isLocked) return;
+                    delay(2000);
+                    updateDisplay("FASE 2", "NFC O DITO");
+                }
+            }
+
+            if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+                String uidStr = "";
+                for (byte i = 0; i < rfid.uid.size; i++) {
+                    uidStr += String(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+                    uidStr += String(rfid.uid.uidByte[i], HEX);
+                }
+                uidStr.toUpperCase();
+
+                Serial.print("[RFID] Lettura transponder. UID estratto: ");
+                Serial.println(uidStr);
+                Serial.println("[SISTEMA] Avvio procedura di verifica server-side...");
+                updateDisplay("ATTESA SVR", "VERIFICA...");
+
+                serverResponseReceived = false;
+                serverAccessGranted = false;
+
+                // Formattazione JSON per la richiesta di check RFID
+                String rfidPayload = "{\"event\":\"rfid_check\",\"uid\":\"" + uidStr + "\"}";
+                mqttClient.publish(topic_rfid_check, rfidPayload.c_str());
+                Serial.print("[MQTT TX] Topic: cancello/rfid/check | Payload JSON: ");
+                Serial.println(rfidPayload);
+
+                unsigned long startTime = millis();
+                while (!serverResponseReceived && millis() - startTime < 5000) {
+                    mqttClient.loop();
+                    delay(10);
+                }
+
+                if (serverResponseReceived) {
+                    if (serverAccessGranted) {
+                        Serial.println("[SISTEMA] Il server ha approvato l'accesso.");
+                        updateDisplay("ACCESSO", "CONSENTITO");
+                        triggerServo();
+                        rfid.PICC_HaltA();
+                        break;
+                    } else {
+                        Serial.println("[SISTEMA] Il server ha negato l'accesso. Tessera non registrata.");
+                        updateDisplay("NEGATO", "NON REGISTR");
+                        handleFailure();
+                    }
+                } else {
+                    Serial.println("[ERRORE] Timeout raggiunto. Il server non ha risposto entro 5 secondi.");
+                    updateDisplay("ERRORE", "TIMEOUT SVR");
+                    handleFailure();
+                }
+
+                if (isLocked) { rfid.PICC_HaltA(); return; }
+                delay(2000);
+                if (!isLocked) updateDisplay("FASE 2", "NFC O DITO");
+                rfid.PICC_HaltA();
+            }
+            delay(50);
+        }
+    }
+}
+
+void checkKeypadInput() {
+    if (isLocked) return;
+
+    if (keyPad.isPressed()) {
+        char key = keyPad.getChar();
+        if (key == '#') {
+            inputBuffer = "";
+            updateDisplay("STANDBY", inputBuffer);
+        }
+        else if (key == '*') {
+            if (inputBuffer == currentPassword) {
+                Serial.println("\n[SISTEMA] PIN digitato da tastierino corretto. Digitare 0 a console per 2FA.");
+                updateDisplay("PIN OK", "USA OPZ. 0");
+            } else {
+                Serial.println("\n[SISTEMA] PIN digitato da tastierino errato.");
+                updateDisplay("PIN ERRATO", "NEGATO");
+                handleFailure();
+            }
+            delay(2000);
+            inputBuffer = "";
+            if (!isLocked) updateDisplay("STANDBY", inputBuffer);
+        }
+        else if (key != 'N') {
+            inputBuffer += key;
+            updateDisplay("INSERIRE PIN", inputBuffer);
+        }
+        delay(250);
+    }
+}
+
+void changePasswordSerial() {
+    Serial.println("\n[ADMIN] Inserimento nuova password numerica:");
+    updateDisplay("MODIFICA PIN", "ATTESA PC");
+    while (!Serial.available()) { mqttClient.loop(); delay(10); }
+    String newPass = Serial.readStringUntil('\n');
+    newPass.trim();
+    if (newPass.length() > 0) {
+        currentPassword = newPass;
+        Serial.print("[ADMIN] Password modificata con successo in: ");
+        Serial.println(currentPassword);
+        updateDisplay("PIN SALVATO", "OK");
+    }
+    delay(2000); updateDisplay("STANDBY", "");
+}
+
+void readNFC() {
+    Serial.println("\n[DIAGNOSTICA] Modalità scansione RFID continua attivata. Avvicinare transponder.");
+    updateDisplay("LETTURA NFC", "AVVICINA TAG");
+    while (!Serial.available()) {
+        mqttClient.loop();
+        if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+            Serial.print("[RFID] Dump RAW UID (Hex): ");
+            for (byte i = 0; i < rfid.uid.size; i++) {
+                Serial.print("0x");
+                Serial.print(rfid.uid.uidByte[i] < 0x10 ? "0" : "");
+                Serial.print(rfid.uid.uidByte[i], HEX);
+                if (i < rfid.uid.size -1) Serial.print(", ");
+            }
+            Serial.println();
+            rfid.PICC_HaltA();
+            delay(2000);
+        }
+        delay(50);
+    }
+    while(Serial.available()) { Serial.read(); }
+    Serial.println("[DIAGNOSTICA] Uscita modalità scansione.");
+    updateDisplay("STANDBY", "");
+}
+
+void fingerprintMenu() {
+    Serial.println("\n--- GESTIONE DATABASE BIOMETRICO ---");
+    Serial.println("1 - Compila nuovo template e salva");
+    Serial.println("2 - Rimuovi indice di memoria");
+    while (!Serial.available()) { mqttClient.loop(); delay(10); }
+    char subCmd = Serial.read();
+    while(Serial.available()) { Serial.read(); }
+
+    if (subCmd == '1') enrollFingerprint();
+    else if (subCmd == '2') deleteFingerprint();
+    updateDisplay("STANDBY", "");
+}
+
+uint8_t getID() {
+    uint8_t id = 0;
+    while (id == 0) {
+        while (!Serial.available()) { mqttClient.loop(); delay(10); }
+        id = Serial.parseInt();
+        while(Serial.available()) { Serial.read(); }
+        if (id < 1 || id > 127) {
+            Serial.println("[ERRORE] Indice fuori limite. Inserire un valore da 1 a 127.");
+            id = 0;
+        }
+    }
+    return id;
+}
+
+void enrollFingerprint() {
+    Serial.println("[ADMIN] Inserire indice di memoria (1-127) per salvataggio impronta:");
+    uint8_t id = getID();
+    Serial.print("[ADMIN] Indice selezionato: "); Serial.println(id);
+
+    Serial.println("[SENS. OTTICO] Posizionare il dito sul sensore...");
+    while (finger.getImage() != FINGERPRINT_OK) { mqttClient.loop(); delay(50); }
+    if (finger.image2Tz(1) != FINGERPRINT_OK) {
+        Serial.println("[ERRORE] Impossibile estrarre le minuzie (Passaggio 1). Riprovare.");
+        return;
+    }
+
+    Serial.println("[SENS. OTTICO] Scansione 1 OK. Sollevare il dito.");
+    delay(2000);
+    while (finger.getImage() != FINGERPRINT_NOFINGER) { mqttClient.loop(); delay(50); }
+
+    Serial.println("[SENS. OTTICO] Riposizionare lo stesso dito per il consolidamento del pattern...");
+    while (finger.getImage() != FINGERPRINT_OK) { mqttClient.loop(); delay(50); }
+    if (finger.image2Tz(2) != FINGERPRINT_OK) {
+        Serial.println("[ERRORE] Impossibile estrarre le minuzie (Passaggio 2). Riprovare.");
+        return;
+    }
+
+    Serial.println("[SENS. OTTICO] Elaborazione e fusione dei template in corso...");
+    if (finger.createModel() == FINGERPRINT_OK && finger.storeModel(id) == FINGERPRINT_OK) {
+        Serial.println("[SUCCESSO] Impronta archiviata permanentemente in memoria NVRAM.");
+        updateDisplay("SUCCESSO", "SALVATA!");
+    } else {
+        Serial.println("[ERRORE] I due campioni non corrispondono o memoria insufficiente.");
+    }
+    delay(2000);
+}
+
+void deleteFingerprint() {
+    Serial.println("[ADMIN] Inserire l'indice di memoria da formattare:");
+    uint8_t id = getID();
+
+    if (finger.deleteModel(id) == FINGERPRINT_OK) {
+        Serial.print("[SUCCESSO] Indice di memoria "); Serial.print(id); Serial.println(" sovrascritto e liberato.");
+        updateDisplay("CANCELLA", "ELIMINATA");
+    } else {
+        Serial.println("[ERRORE] Indice vuoto o operazione fallita.");
+    }
+    delay(2000);
+}
+
+void testFingerprint() {
+    Serial.println("\n[DIAGNOSTICA] Loop di test matching biometrico attivato. Posizionare un dito.");
+    updateDisplay("TEST IMPRONTA", "APPOGGIA DITO");
+
+    while (!Serial.available()) {
+        mqttClient.loop();
+        if (finger.getImage() == FINGERPRINT_OK && finger.image2Tz() == FINGERPRINT_OK) {
+            if(finger.fingerSearch() == FINGERPRINT_OK) {
+                Serial.print("[SUCCESSO] Dito riconosciuto. Indice in memoria: ");
+                Serial.println(finger.fingerID);
+                updateDisplay("MATCH OK", "ID: " + String(finger.fingerID));
+            } else {
+                Serial.println("[FALLIMENTO] Impronta non presente nel database locale.");
+                updateDisplay("ERRORE", "NON TROVATA");
+            }
+            delay(2000);
+            updateDisplay("TEST IMPRONTA", "APPOGGIA DITO");
+        }
+        delay(50);
+    }
+    while(Serial.available()) { Serial.read(); }
+    Serial.println("[DIAGNOSTICA] Uscita modalità test.");
+    updateDisplay("STANDBY", "");
+}
+
+void setServoDegrees() {
+    Serial.println("[DIAGNOSTICA] Inserire valore PWM assoluto in gradi (0-180):");
+    while (!Serial.available()) { mqttClient.loop(); delay(10); }
+    int degrees = Serial.parseInt();
+    while(Serial.available()) { Serial.read(); }
+
+    if (degrees >= 0 && degrees <= 180) {
+        Serial.print("[ATTUATORE] Segnale forzato a gradi: ");
+        Serial.println(degrees);
+        myServo.write(degrees);
+    } else {
+        Serial.println("[ERRORE] Valore fuori limite fisico.");
+    }
+    updateDisplay("STANDBY", "");
+}
